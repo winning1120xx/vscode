@@ -3,99 +3,300 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// Will be defined if we got forked from another node process
-// In that case we override console.log/warn/error to be able
-// to send loading issues to the main side for logging.
-if (!!process.send && process.env.PIPE_LOGGING === 'true') {
-	var MAX_LENGTH = 100000;
+//@ts-check
+'use strict';
 
-	// Prevent circular stringify
-	function safeStringify(obj) {
-		var seen = [];
-		var res;
-		try {
-			res = JSON.stringify(obj, function (key, value) {
+//#region global bootstrapping
 
-				// Objects get special treatment to prevent circles
-				if (value && Object.prototype.toString.call(value) === '[object Object]') {
-					if (seen.indexOf(value) !== -1) {
-						return Object.create(null); // prevent circular references!
-					}
+// increase number of stack frames(from 10, https://github.com/v8/v8/wiki/Stack-Trace-API)
+Error.stackTraceLimit = 100;
 
-					seen.push(value);
-				}
-
-				return value;
-			});
-		} catch (error) {
-			return 'Output omitted for an object that cannot be inspected (' + error.toString() + ')';
-		}
-
-		if (res && res.length > MAX_LENGTH) {
-			return 'Output omitted for a large object that exceeds the limits';
-		}
-
-		return res;
-	}
-
-	// Pass console logging to the outside so that we have it in the main side if told so
-	if (process.env.VERBOSE_LOGGING === 'true') {
-		console.log = function () { process.send({ type: '__$console', severity: 'log', arguments: safeStringify(arguments) }); };
-		console.warn = function () { process.send({ type: '__$console', severity: 'warn', arguments: safeStringify(arguments) }); };
-	} else {
-		console.log = function () { /* ignore */ };
-		console.warn = function () { /* ignore */ };
-	}
-	
-	console.error = function () { process.send({ type: '__$console', severity: 'error', arguments: safeStringify(arguments) }); };
-
-	// Let stdout, stderr and stdin be no-op streams. This prevents an issue where we would get an EBADF
-	// error when we are inside a forked process and this process tries to access those channels.
-	var stream = require('stream');
-	var writable = new stream.Writable({
-		write: function (chunk, encoding, next) { /* No OP */ }
-	});
-	process.__defineGetter__('stdout', function() { return writable; });
-	process.__defineGetter__('stderr', function() { return writable; });
-	process.__defineGetter__('stdin', function() { return writable; });
-}
-
-// Handle uncaught exceptions
-process.on('uncaughtException', function (err) {
-	console.error('Uncaught Exception: ', err.toString());
-	if (err.stack) {
-		console.error(err.stack);
-	}
+// Workaround for Electron not installing a handler to ignore SIGPIPE
+// (https://github.com/electron/electron/issues/13254)
+// @ts-ignore
+process.on('SIGPIPE', () => {
+	console.error(new Error('Unexpected SIGPIPE'));
 });
 
-var path = require('path');
-var loader = require('./vs/loader');
+//#endregion
 
-// TODO: Duplicated in:
-// * src\bootstrap.js
-// * src\vs\workbench\electron-main\bootstrap.js
-// * src\vs\platform\plugins\common\nativePluginService.ts
-function uriFromPath(_path) {
-	var pathName = path.resolve(_path).replace(/\\/g, '/');
+//#region Add support for redirecting the loading of node modules
 
+exports.injectNodeModuleLookupPath = function (injectPath) {
+	if (!injectPath) {
+		throw new Error('Missing injectPath');
+	}
+
+	// @ts-ignore
+	const Module = require('module');
+	const path = require('path');
+
+	const nodeModulesPath = path.join(__dirname, '../node_modules');
+
+	// @ts-ignore
+	const originalResolveLookupPaths = Module._resolveLookupPaths;
+
+	// @ts-ignore
+	Module._resolveLookupPaths = function (moduleName, parent) {
+		const paths = originalResolveLookupPaths(moduleName, parent);
+		for (let i = 0, len = paths.length; i < len; i++) {
+			if (paths[i] === nodeModulesPath) {
+				paths.splice(i, 0, injectPath);
+				break;
+			}
+		}
+
+		return paths;
+	};
+};
+//#endregion
+
+//#region Add support for using node_modules.asar
+/**
+ * @param {string=} nodeModulesPath
+ */
+exports.enableASARSupport = function (nodeModulesPath) {
+
+	// @ts-ignore
+	const Module = require('module');
+	const path = require('path');
+
+	let NODE_MODULES_PATH = nodeModulesPath;
+	if (!NODE_MODULES_PATH) {
+		NODE_MODULES_PATH = path.join(__dirname, '../node_modules');
+	}
+
+	const NODE_MODULES_ASAR_PATH = NODE_MODULES_PATH + '.asar';
+
+	// @ts-ignore
+	const originalResolveLookupPaths = Module._resolveLookupPaths;
+
+	// @ts-ignore
+	Module._resolveLookupPaths = function (request, parent) {
+		const paths = originalResolveLookupPaths(request, parent);
+		for (let i = 0, len = paths.length; i < len; i++) {
+			if (paths[i] === NODE_MODULES_PATH) {
+				paths.splice(i, 0, NODE_MODULES_ASAR_PATH);
+				break;
+			}
+		}
+
+		return paths;
+	};
+};
+//#endregion
+
+//#region URI helpers
+/**
+ * @param {string} _path
+ * @returns {string}
+ */
+exports.uriFromPath = function (_path) {
+	const path = require('path');
+
+	let pathName = path.resolve(_path).replace(/\\/g, '/');
 	if (pathName.length > 0 && pathName.charAt(0) !== '/') {
 		pathName = '/' + pathName;
 	}
 
-	return encodeURI('file://' + pathName);
+	/** @type {string} */
+	let uri;
+	if (process.platform === 'win32' && pathName.startsWith('//')) { // specially handle Windows UNC paths
+		uri = encodeURI('file:' + pathName);
+	} else {
+		uri = encodeURI('file://' + pathName);
+	}
+
+	return uri.replace(/#/g, '%23');
+};
+//#endregion
+
+//#region FS helpers
+/**
+ * @param {string} file
+ * @returns {Promise<string>}
+ */
+exports.readFile = function (file) {
+	const fs = require('fs');
+
+	return new Promise(function (resolve, reject) {
+		fs.readFile(file, 'utf8', function (err, data) {
+			if (err) {
+				reject(err);
+				return;
+			}
+			resolve(data);
+		});
+	});
+};
+
+/**
+ * @param {string} file
+ * @param {string} content
+ * @returns {Promise<void>}
+ */
+exports.writeFile = function (file, content) {
+	const fs = require('fs');
+
+	return new Promise(function (resolve, reject) {
+		fs.writeFile(file, content, 'utf8', function (err) {
+			if (err) {
+				reject(err);
+				return;
+			}
+			resolve();
+		});
+	});
+};
+
+/**
+ * @param {string} dir
+ * @returns {Promise<string>}
+ */
+function mkdir(dir) {
+	const fs = require('fs');
+
+	return new Promise((c, e) => fs.mkdir(dir, err => (err && err.code !== 'EEXIST') ? e(err) : c(dir)));
 }
 
-loader.config({
-	baseUrl: uriFromPath(path.join(__dirname, '..')),
-	paths: {
-		'vs': path.basename(__dirname) + '/vs'
-	},
-	catchError: true,
-	nodeRequire: require,
-	nodeMain: __filename
-});
+/**
+ * @param {string} dir
+ * @returns {Promise<string>}
+ */
+exports.mkdirp = function mkdirp(dir) {
+	const path = require('path');
 
-var entrypoint = process.env.AMD_ENTRYPOINT;
-if (entrypoint) {
-	loader([entrypoint], function () { }, function (err) { console.error(err); });
-}
+	return mkdir(dir).then(null, err => {
+		if (err && err.code === 'ENOENT') {
+			const parent = path.dirname(dir);
+
+			if (parent !== dir) { // if not arrived at root
+				return mkdirp(parent).then(() => mkdir(dir));
+			}
+		}
+
+		throw err;
+	});
+};
+//#endregion
+
+//#region NLS helpers
+/**
+ * @returns {{locale?: string, availableLanguages: {[lang: string]: string;}, pseudo?: boolean }}
+ */
+exports.setupNLS = function () {
+	const path = require('path');
+
+	// Get the nls configuration into the process.env as early as possible.
+	let nlsConfig = { availableLanguages: {} };
+	if (process.env['VSCODE_NLS_CONFIG']) {
+		try {
+			nlsConfig = JSON.parse(process.env['VSCODE_NLS_CONFIG']);
+		} catch (e) {
+			// Ignore
+		}
+	}
+
+	if (nlsConfig._resolvedLanguagePackCoreLocation) {
+		const bundles = Object.create(null);
+
+		nlsConfig.loadBundle = function (bundle, language, cb) {
+			const result = bundles[bundle];
+			if (result) {
+				cb(undefined, result);
+
+				return;
+			}
+
+			const bundleFile = path.join(nlsConfig._resolvedLanguagePackCoreLocation, bundle.replace(/\//g, '!') + '.nls.json');
+			exports.readFile(bundleFile).then(function (content) {
+				const json = JSON.parse(content);
+				bundles[bundle] = json;
+
+				cb(undefined, json);
+			}).catch((error) => {
+				try {
+					if (nlsConfig._corruptedFile) {
+						exports.writeFile(nlsConfig._corruptedFile, 'corrupted').catch(function (error) { console.error(error); });
+					}
+				} finally {
+					cb(error, undefined);
+				}
+			});
+		};
+	}
+
+	return nlsConfig;
+};
+//#endregion
+
+//#region Portable helpers
+/**
+ * @returns {{ portableDataPath: string, isPortable: boolean }}
+ */
+exports.configurePortable = function () {
+	// @ts-ignore
+	const product = require('../product.json');
+	const path = require('path');
+	const fs = require('fs');
+
+	const appRoot = path.dirname(__dirname);
+
+	function getApplicationPath() {
+		if (process.env['VSCODE_DEV']) {
+			return appRoot;
+		}
+
+		if (process.platform === 'darwin') {
+			return path.dirname(path.dirname(path.dirname(appRoot)));
+		}
+
+		return path.dirname(path.dirname(appRoot));
+	}
+
+	function getPortableDataPath() {
+		if (process.env['VSCODE_PORTABLE']) {
+			return process.env['VSCODE_PORTABLE'];
+		}
+
+		if (process.platform === 'win32' || process.platform === 'linux') {
+			return path.join(getApplicationPath(), 'data');
+		}
+
+		const portableDataName = product.portable || `${product.applicationName}-portable-data`;
+		return path.join(path.dirname(getApplicationPath()), portableDataName);
+	}
+
+	const portableDataPath = getPortableDataPath();
+	const isPortable = !('target' in product) && fs.existsSync(portableDataPath);
+	const portableTempPath = path.join(portableDataPath, 'tmp');
+	const isTempPortable = isPortable && fs.existsSync(portableTempPath);
+
+	if (isPortable) {
+		process.env['VSCODE_PORTABLE'] = portableDataPath;
+	} else {
+		delete process.env['VSCODE_PORTABLE'];
+	}
+
+	if (isTempPortable) {
+		process.env[process.platform === 'win32' ? 'TEMP' : 'TMPDIR'] = portableTempPath;
+	}
+
+	return {
+		portableDataPath,
+		isPortable
+	};
+};
+//#endregion
+
+//#region ApplicationInsights
+/**
+ * Prevents appinsights from monkey patching modules.
+ * This should be called before importing the applicationinsights module
+ */
+exports.avoidMonkeyPatchFromAppInsights = function () {
+	// @ts-ignore
+	process.env['APPLICATION_INSIGHTS_NO_DIAGNOSTIC_CHANNEL'] = true; // Skip monkey patching of 3rd party modules by appinsights
+	global['diagnosticsSource'] = {}; // Prevents diagnostic channel (which patches "require") from initializing entirely
+};
+//#endregion
